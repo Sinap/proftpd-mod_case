@@ -26,7 +26,7 @@
 #include "conf.h"
 #include "privs.h"
 
-#define MOD_CASE_VERSION	"mod_case/0.8"
+#define MOD_CASE_VERSION    "mod_case/0.8"
 
 /* Make sure the version of proftpd is as necessary. */
 #if PROFTPD_VERSION_NUMBER < 0x0001030402
@@ -41,11 +41,42 @@ static const char *trace_channel = "case";
 /* Support routines
  */
 
+static char **split_path(char path[], char *t) {
+  char **res = NULL;
+  char *tmp_path = malloc(strlen(path)+1);
+  if (tmp_path) {
+    strcpy(tmp_path, path);
+  } else {
+    pr_log_writefile(case_logfd, MOD_CASE_VERSION,
+                     "failed to split path: '%s' (can't allocate memory)", path);
+    return res;
+  }
+
+  char *p = strtok(tmp_path, t);
+  int i = 0;
+  while (p) {
+    res = realloc(res, sizeof(char*) * ++i);
+    if (res == NULL) {
+      pr_log_writefile(case_logfd, MOD_CASE_VERSION,
+                       "failed to split path: '%s'", tmp_path);
+      return res;
+    }
+    res[i-1] = p;
+    p = strtok(NULL, t);
+  }
+
+  // add a null terminator to end of array
+  res = realloc(res, sizeof(char*) * (i+1));
+  res[i] = '\0';
+
+  return res;
+}
+
 static int case_expr_eval_cmds(cmd_rec *cmd, array_header *list) {
   int cmd_id, found;
   register unsigned int i;
 
-  for (i = 0; i < list->nelts; i++) { 
+  for (i = 0; i < list->nelts; i++) {
     char *c = ((char **) list->elts)[i];
     found = 0;
 
@@ -400,6 +431,69 @@ static int case_have_file(pool *p, const char *dir, const char *file,
   return FALSE;
 }
 
+static int case_search_file(pool *p, char *dir, const char *file,
+                            size_t file_len, char **matched_file,
+                            char **matched_dir) {
+  // this function should actually work in reverse but it would be a lot
+  // more complicated. So if the path is wrong then we work from the root
+  // searching for each folder and correcting it.
+
+  // check to see if path is correct and only the filename is wrong
+  int i = 0;
+  int res = case_have_file(p, dir, file, file_len, matched_file);
+  if (res == TRUE) {
+    return res;
+  }
+
+  pr_trace_msg(trace_channel, 9,
+               "failed to match '%s/%s' checking each folder in the path",
+               dir, file);
+  char **spath = split_path(dir, "/");
+  if (spath == NULL) {
+    return FALSE;
+  }
+
+  char *new_path = "/";
+  char *new_file = NULL;
+  for (i = 0; spath[i] != 0; ++i) {
+    char *mfile = NULL;
+    // don't set the path on the first iteration
+    if (i != 0) {
+      new_path = pstrcat(p, new_path, spath[i-1], "/", NULL);
+    }
+    // search for the current file
+    new_file = spath[i];
+    res = case_have_file(p, new_path, new_file, strlen(new_file), &mfile);
+
+    // if failed to open directory or file doesn't exist
+    if (res <= 0) {
+      return FALSE;
+    }
+
+    // file name is different, so change the path
+    if (mfile != NULL) {
+      strcpy(spath[i], mfile);
+    }
+  }
+
+  // convert spath into a string path
+  char *final_dir = "/";
+  for (i = 0; spath[i] != 0; ++i) {
+    // don't add the trailing '/'
+    if (spath[i+1] == 0) {
+      final_dir = pstrcat(p, final_dir, spath[i], NULL);
+    } else {
+      final_dir = pstrcat(p, final_dir, spath[i], "/", NULL);
+    }
+  }
+
+  // replace dir with the fixed path
+  *matched_dir = pstrdup(p, final_dir);
+  pr_trace_msg(trace_channel, 9,
+               "original dir: '%s' corrected dir: '%s'", dir, *matched_dir);
+  return case_have_file(p, *matched_dir, file, file_len, matched_file);
+}
+
 /* Command handlers
  */
 
@@ -558,7 +652,7 @@ MODRET case_pre_copy(cmd_rec *cmd) {
 MODRET case_pre_cmd(cmd_rec *cmd) {
   config_rec *c;
   char *path = NULL, *dir = NULL, *file = NULL, *file_match = NULL,
-    *replace_path = NULL, *tmp;
+    *dir_match = NULL, *replace_path = NULL, *tmp;
   const char *proto = NULL;
   size_t file_len;
   int path_index = -1, res;
@@ -682,12 +776,13 @@ MODRET case_pre_cmd(cmd_rec *cmd) {
   pr_trace_msg(trace_channel, 9, "checking for file '%s' in directory '%s'",
     file, dir);
 
-  res = case_have_file(cmd->tmp_pool, dir, file, file_len, &file_match);
+  res = case_search_file(cmd->tmp_pool, dir, file, file_len, &file_match,
+                         &dir_match);
   if (res < 0) {
     return PR_DECLINED(cmd);
   }
 
-  if (res == FALSE) {
+  if (res == FALSE && pr_cmd_cmp(cmd, PR_CMD_STOR_ID) == 0) {
     /* No match found. */
     pr_trace_msg(trace_channel, 9,
       "no case-insensitive matches found for file '%s' in directory '%s'",
@@ -696,21 +791,23 @@ MODRET case_pre_cmd(cmd_rec *cmd) {
   }
 
   /* We found a match for the given file. */
-
-  if (file_match == NULL) {
+  if (file_match == NULL && dir_match == NULL) {
     /* Exact match found; nothing more to do. */
     return PR_DECLINED(cmd);
   }
 
-  /* Overwrite the client-given path. */
+  if (file_match == NULL) {
+    file_match = file;
+  }
 
-  replace_path = tmp ? pstrcat(cmd->tmp_pool, dir, "/", NULL) : "";
+  /* Overwrite the client-given path. */
+  replace_path = tmp ? pstrcat(cmd->tmp_pool, dir_match, "/", NULL) : "";
   replace_path = pdircat(cmd->tmp_pool, replace_path, file_match, NULL);
   pr_trace_msg(trace_channel, 9, "replacing path '%s' with '%s'",
     path, replace_path);
 
   case_replace_path(cmd, proto,
-    tmp ? pstrcat(cmd->pool, dir, "/", NULL) : "", file_match, path_index);
+    tmp ? pstrcat(cmd->pool, dir_match, "/", NULL) : "", file_match, path_index);
 
   return PR_DECLINED(cmd);
 }
@@ -966,7 +1063,7 @@ static int case_sess_init(void) {
     if (res < 0) {
       pr_log_pri(PR_LOG_NOTICE, MOD_CASE_VERSION
         ": error opening CaseLog '%s': %s", (char *) c->argv[0],
-        strerror(errno)); 
+        strerror(errno));
     }
   }
 
@@ -977,43 +1074,43 @@ static int case_sess_init(void) {
  */
 
 static conftable case_conftab[] = {
-  { "CaseEngine",	set_caseengine,		NULL },
-  { "CaseIgnore",	set_caseignore,		NULL },
-  { "CaseLog",		set_caselog,		NULL },
+  { "CaseEngine",   set_caseengine,     NULL },
+  { "CaseIgnore",   set_caseignore,     NULL },
+  { "CaseLog",      set_caselog,        NULL },
   { NULL }
 };
 
 static cmdtable case_cmdtab[] = {
-  { PRE_CMD,	C_APPE,	G_NONE,	case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_CWD,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_DELE,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_LIST,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_MDTM,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_MKD,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_MLSD,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_MLST,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_NLST,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_RETR,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_RMD,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_RNFR,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_RNTO,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_SITE,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_SIZE,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_STAT,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_STOR,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_XCWD,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_XMKD,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	C_XRMD,	G_NONE, case_pre_cmd,	TRUE,	FALSE },
+  { PRE_CMD,    C_APPE, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_CWD,  G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_DELE, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_LIST, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_MDTM, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_MKD,  G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_MLSD, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_MLST, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_NLST, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_RETR, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_RMD,  G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_RNFR, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_RNTO, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_SITE, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_SIZE, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_STAT, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_STOR, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_XCWD, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_XMKD, G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    C_XRMD, G_NONE, case_pre_cmd,   TRUE,   FALSE },
 
   /* The following are SFTP requests */
-  { PRE_CMD,	"LINK",		G_NONE, case_pre_link,	TRUE,	FALSE },
-  { PRE_CMD,	"LSTAT",	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	"OPENDIR",	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	"READLINK",	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	"REALPATH",	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	"SETSTAT",	G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	"STAT",		G_NONE, case_pre_cmd,	TRUE,	FALSE },
-  { PRE_CMD,	"SYMLINK",	G_NONE, case_pre_link,	TRUE,	FALSE },
+  { PRE_CMD,    "LINK",     G_NONE, case_pre_link,  TRUE,   FALSE },
+  { PRE_CMD,    "LSTAT",    G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    "OPENDIR",  G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    "READLINK", G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    "REALPATH", G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    "SETSTAT",  G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    "STAT",     G_NONE, case_pre_cmd,   TRUE,   FALSE },
+  { PRE_CMD,    "SYMLINK",  G_NONE, case_pre_link,  TRUE,   FALSE },
 
   { 0, NULL }
 };
